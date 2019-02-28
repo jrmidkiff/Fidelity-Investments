@@ -1,0 +1,151 @@
+library(tidyverse)
+library(rvest)
+library(jsonlite)
+library(lubridate)
+library(scales)
+
+# READ THIS - NO NEED TO SCRAPE IT 
+# https://onlinejournalismblog.com/2017/05/10/how-to-find-data-behind-chart-map-using-inspector/
+# !) Right-Click on graph > Inspect 
+# 2) Click Network on top right (it should start recording)
+# 3) Filter to XHR at top
+# 4) Data will be called api
+# 5) Right-click api > Copy > Copy Response
+# 6) Paste into text document as JSON
+# 7) If things get cluttered, clear the Network monitoring and try again. If you refresh the entire page though, the graph only loads the one-year history and it will monitor everything the webpage loads
+
+# The data will always be one-day behind the current day
+original_list <- as.list(fromJSON(txt = "D:/Everything/R/Fidelity Investments Analysis/Individual Account Through 02-19-19.txt"))
+daily_balance <- as.tibble(original_list$balances) %>% 
+  filter(value != 0) %>% 
+  mutate(date = mdy(date))
+
+setwd("D:/Everything/R/Fidelity Investments Analysis/Transactions")
+
+files <- list.files(pattern = "History.*.csv")
+big_list <- lapply(files, read_csv)
+initial_data <- do.call("rbind", big_list)
+
+transactions <- initial_data %>% 
+  filter(str_detect(`Run Date`, "^\\d{2}.*"), 
+         str_detect(Action, "YOU BOUGHT.*")) %>% 
+  mutate(`Run Date` = mdy(`Run Date`), 
+         Quantity = as.double(Quantity), 
+         Price = as.double(`Price ($)`), 
+         Amount = as.double(`Amount ($)`), 
+         `Settlement Date` = mdy(`Settlement Date`)) 
+transactions_cleaned <- transactions %>% 
+  filter(!duplicated(`Run Date`)) %>% 
+  select(`Run Date`, Quantity, Price, Amount, `Settlement Date`) %>% 
+  arrange(desc(`Run Date`))
+
+(final_daily_balance <- left_join(daily_balance, transactions_cleaned, by = c("date" = "Settlement Date")) %>% 
+  select(date, value, Quantity, Amount) %>% # Join based on the orders' Settlement Date
+  filter(date >= mdy("03-20-17")) %>% 
+  mutate(Quantity = replace_na(Quantity, 0), 
+         Amount = replace_na(Amount, 0), 
+         Total_Quantity = cumsum(Quantity), 
+         Total_Principal = cumsum(-Amount)))
+
+# Fix these two days to make sense
+final_daily_balance$Total_Quantity[final_daily_balance$date == mdy("03-20-17")] <- 41.956
+final_daily_balance$Total_Principal[final_daily_balance$date == mdy("03-20-17")] <- 3500
+
+final_daily_balance <- final_daily_balance %>% 
+  mutate(end_daily_price = value / Total_Quantity, 
+         Black_Or_Red = ifelse(value > Total_Principal, "black", "red")) # Am I in the black or in the red?
+
+total_amount_graph <- final_daily_balance %>% 
+  select(date, value, Total_Principal, Black_Or_Red) %>% 
+  gather(key = Factor, value = Money, -date, -Black_Or_Red) %>% 
+  mutate(Factor = as_factor(Factor))
+         
+
+str(total_amount_graph)
+# The trade date is the day the trade starts and the day that the price is agreed upon. For this fund, the price agreed upon is always the next calculated Net Asset Value. 
+# The settlement date is always one business day after the trade date and it is the date at which ownership of the mutual fund shares is completed. 
+
+# The transactions comes from the excel documents, the fidelity tab 'Activity & Orders' and then History
+ 
+# This graph is very close but will always have one of the factors covering up the other. 
+sf = stamp("February 19, 2019")
+xmin = min(total_amount_graph$date) 
+ymax = max(total_amount_graph$Money)
+ymax_step = (ymax - 0) / 20
+current_account_value = max(total_amount_graph$Money[total_amount_graph$Factor == "value"])
+total_principal_invested = max(total_amount_graph$Money[total_amount_graph$Factor == "Total_Principal"])
+percent_difference = (current_account_value / total_principal_invested) - 1
+total_days = as.integer(max(total_amount_graph$date) - min(total_amount_graph$date))
+total_years = total_days / 365.25
+# interest_rate = (((current_account_value / 3500)^(1 / (total_days * total_years))) - 1) * total_days
+
+# Creating the additional x and y points #####
+value_set <- total_amount_graph %>% 
+  filter(Factor == "value") %>% 
+  mutate(end_date = NA, 
+         end_money = NA)
+
+for(i in seq_along(1:(nrow(value_set)-1))) {
+  value_set$end_date[[i]] <- value_set$date[[i+1]]
+  value_set$end_money[[i]] <- value_set$Money[[i+1]]
+}
+value_set <- value_set %>% 
+  mutate(end_date = as_date(end_date))
+value_set
+
+principal_set <- total_amount_graph %>% 
+  filter(Factor == "Total_Principal") %>% 
+  mutate(end_date = NA, 
+         end_money = NA)
+
+for(i in seq_along(1:(nrow(principal_set)-1))) {
+  principal_set$end_date[[i]] <- principal_set$date[[i+1]]
+  principal_set$end_money[[i]] <- principal_set$Money[[i+1]]
+}
+principal_set <- principal_set %>% 
+  mutate(end_date = as_date(end_date))
+principal_set
+
+total_amount_graph <- bind_rows(value_set, principal_set)
+total_amount_graph <- total_amount_graph %>% 
+  mutate(Black_Or_Red = ifelse(Factor == "Total_Principal", "black", Black_Or_Red))
+
+# Graph #####
+ggplot(total_amount_graph, aes(x = date, y = Money, fill = Factor)) +
+  geom_area(position = position_dodge(width = 0)) +
+  scale_fill_manual(values = c("#98BD4F", "#586f2a"), 
+                    labels = c("Account Value", "Total Principal")) +
+  geom_segment(data = total_amount_graph, 
+               mapping = aes(x = date, xend = end_date, y = Money, yend = end_money, color = Black_Or_Red), 
+               size = 1, show.legend = F) +
+  scale_color_manual(values = c("black" = "black", "red" = "red")) +
+  labs(title = "S&P 500 Index Fund Account Value vs. Principle", 
+       subtitle = str_c("March 20, 2017 - ", format(max(total_amount_graph$date), format = "%B %d, %Y")), 
+       x = "Date", 
+       y = NULL
+  ) +
+  scale_y_continuous(labels = dollar) +
+  theme(legend.title = element_blank()) +
+  annotate("text", x = xmin, y = ymax, 
+           label = str_c("Current Account Value: ", dollar(current_account_value, accuracy = 2)), 
+           hjust = 0) +
+  annotate("text", x = xmin, y = ymax - ymax_step, 
+           label = str_c("Total Principal Invested: ", dollar(total_principal_invested, accuracy = 2)),  
+           hjust = 0) + 
+  annotate("text", x = xmin, y = ymax - ymax_step * 2, 
+           label = str_c("Percent Difference: ", percent(percent_difference)), 
+           hjust = 0)
+
+  
+ggplot(total_amount_graph, aes(x = date, xend = end_date, y = Money, yend = end_money, color = Black_Or_Red)) +
+  geom_segment(size = 1) +
+  scale_color_manual(values = c("black" = "black", "red" = "red"))
+# Annual Percentage Rate
+# Net gain
+# Biggest / Smallest Percent Difference
+# Axis breaks and text
+# Check this out: https://stackoverflow.com/questions/35039846/change-line-color-depending-on-y-value-with-ggplot2
+ 
+# Orders
+ 
+
